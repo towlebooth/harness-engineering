@@ -1,5 +1,247 @@
 # @harness-engineering/cli
 
+## 10.0.0
+
+### Minor Changes
+
+- c4c1dd3: feat(local-models): harness-fit probe — empirical agentic evidence for model recommendation
+
+  The local-model recommender ranks candidates by benchmark evidence plus a thin
+  agentic probe that only checks _"can the model emit a `tool_call`?"_ and _"is one
+  turn fast enough?"_. A live 3-way head-to-head proved this necessary-but-insufficient
+  for autonomous coding: `llama3.3:70b` **passes** the tool-calling gate and is fast,
+  yet it **narrated instead of acting** (one tool call, no artifact, gate never green),
+  while the smaller `gpt-oss:20b`/`qwen3.6:27b` **acted and converged**. No benchmark or
+  thin-probe signal predicted that — only running the real harness did.
+
+  The **harness-fit probe** supplies the missing empirical evidence. It runs a
+  benchmark-shortlisted candidate through a small contained coding task **on the real
+  harness**, judges convergence (the task's own acceptance command) plus act-vs-narrate
+  metrics from the recording stream, and maps them to a coarse `buildQuality ∈ [0, 1]`
+  (converged → HIGH, acted-not-converged → MID, narrated → LOW). That number feeds the
+  **already-wired** `buildQuality` slot in the `agenticScore` composition — **no
+  ranker-math change** — so at equal benchmark score an act-and-converge model out-ranks
+  a narrate-only one for autonomous dispatch, while the default `score` ordering is
+  untouched.
+  - **Pure policy + injected runner (dependency inversion).** `local-models` owns the
+    pure parts — the `buildQuality` mapping (`scoreBuildQuality`), the cost-gating policy
+    (`selectProbeTargets` / `isProbeDue` / `isCacheFresh` / `probeCacheKey`), the portable
+    task-suite schema + `DEFAULT_HARNESS_FIT_TASKS`, and the `HarnessFitRunner` interface.
+    The concrete single-dispatch runner (Ollama backend + throwaway workspace + acceptance
+    gate, reading the stream for act-vs-narrate metrics) is implemented in the orchestrator
+    and injected at the composition root, so `local-models` never depends on the orchestrator.
+  - **Single-dispatch convergence micro-probe.** The act-vs-narrate signal is decisive in
+    one dispatch; best-of-1, cheapest real signal.
+  - **Cost-gated (opt-in, top-N, cadence, cache, prefilter).** Disabled by default
+    (`localModels.harnessFit.enabled`). When enabled, only the benchmark top-N are probed
+    (never the full set), on a cadence (not every refresh), with `buildQuality` cached by
+    model+version and VRAM-unfit / `toolCalling:false` candidates prefiltered out.
+  - **Fail-open everywhere.** Any probe error/timeout/pull-failure leaves `buildQuality`
+    undefined ⇒ no ranking effect; the refresh is never broken and the pool is never blocked.
+  - **Config surface.** New optional `localModels.harnessFit` block (added to both the TS
+    type and the Zod schema so it survives config parse) — `enabled`, `topN`, `cadenceMs`,
+    `cacheTtlMs`, optional `taskIds`. Adopter-portable probe tasks self-describe their
+    acceptance command, so a probe runs in any adopter project.
+  - **Wired at the composition root (the probe actually fires).** `startRefreshScheduler`
+    constructs the `HarnessFitProbeRunner`, a persistent `HarnessFitCacheFileStore` under
+    `~/.harness/local-models/` (buildQuality cache + cadence timestamp), and a
+    `reRankWithBuildQuality` binding that re-runs the SAME ranker over the held candidate
+    set with probed `buildQuality` threaded in — passing them as the tick's `harnessFit`
+    deps ONLY when `localModels.harnessFit.enabled` (config→deps translation:
+    `cadenceMs → intervalMs`, `taskIds → tasks`). Disabled/absent ⇒ no deps are passed and
+    the tick is byte-identical to before.
+  - **Bounded (no hangs).** The runner enforces an overall per-probe wall-clock timeout
+    (default 5 min) around both the dispatch and the acceptance-command spawn — `maxTurns`
+    bounds turn count but not wall time, so a hung model or hanging acceptance is aborted
+    into a fail-open `error` result instead of blocking the refresh tick.
+  - **Converged-without-artifact is suspect.** A converged verdict only scores HIGH when the
+    model actually touched a file; a trivially-passing acceptance with no artifact drops to
+    MID/LOW rather than earning the top band.
+
+  See ADR 0081 (harness-fit probe: benchmarks pre-filter, the harness judges agentic fitness).
+
+- e203b5e: Add `harness integrations sync` — reconcile a project's configured MCP
+  servers against the refreshed catalog, with the operator's consent. It diffs
+  the configured servers against `INTEGRATION_REGISTRY`, shows what's newly
+  suggested (e.g. github, exa, harness) and what's deprecated (perplexity,
+  augment-code, sequential-thinking), and applies changes only on agreement:
+  report-only by default; `--apply` prompts per group in a TTY; `--yes` applies
+  non-interactively; a non-TTY run without `--yes` never mutates (safe in
+  automation). Additions/removals reuse the existing add/remove/dismiss config
+  plumbing; Tier-1 servers surface their required env var and never invent a
+  secret.
+
+  To make it discoverable, `harness update` now prints a report-only drift
+  nudge after updating (and `harness doctor`'s freshness advisory points at it),
+  so a refreshed catalog isn't invisible to a project that configured its
+  servers earlier.
+
+- fac4261: Local backend runs the full harness workflow (gated). A `local`/`pi` dispatch now renders a backend-specific dispatch template (`harness.orchestrator.local.md`). Rather than paraphrasing the workflow inline, that template is a thin indirection shim that delivers the REAL skills over bash: the pi agent runs `harness skill run <name> --autonomous` (which prints the verbatim `SKILL.md`, no MCP required) and follows a `/harness:X` → `harness skill run harness-X` redirect. The new `--autonomous` flag on `harness skill run` prepends an autonomous-decider preamble so a headless agent runs each skill (including brainstorming) at full rigor but decides every fork itself and records it in the spec — with a PR-flag safety valve for low-confidence and strategy-contradiction forks, and no mid-run human pause; absent the flag, skill-run output is byte-identical to before. The orchestrator ENFORCES the verify + outcome-eval gates itself (`runLocalWorkflowGate` in `finalizeNormalCompletion`): a red verify or a high-confidence `NOT_SATISFIED` verdict routes through the existing `emitWorkerExit('error')` retry branch (re-prompt on retry, `needs-human` on budget exhaustion) so poor local output halts rather than ships. Template selection (`resolvePromptTemplate`) falls back to the default Claude template when the local file is absent, and the Claude/AMR completion path is unchanged (the gate is a no-op for non-local backends). A config flag `agent.routing.workflowGates: local | primary` routes the local outcome-eval gate to a stronger provider (default local SEL; the AMR caller is unaffected). See ADRs 0070/0071/0072.
+- cffa06a: Refresh the suggested MCP-server catalog to 2026 best-in-class and make it
+  freshness-aware. `INTEGRATION_REGISTRY` now suggests context7, playwright,
+  the official GitHub MCP, Exa (agent search), and harness's own MCP; the
+  stale perplexity / augment-code / sequential-thinking suggestions are
+  removed (removal only stops _suggesting_ — it never touches an installed
+  integration). Every entry carries a `lastReviewed` date and a
+  `CATALOG_LAST_REVIEWED` const; `harness doctor` emits a non-blocking advisory
+  when the catalog is older than 120 days so it signals its own staleness.
+- fac4261: fix(triage): select the local model from the LMLM pool (reasoning-ranked), not the static config list
+
+  `harness roadmap triage` resolved its local model from `agent.backends.local.model[0]` — a
+  fixed, hand-maintained list — so triage could stay pinned to a weak model even after the Local
+  Model Lifecycle Manager pool had installed and ranked a stronger one. The live orchestrator does
+  not have this problem: its `LocalModelResolver` derives candidates from the pool via
+  `poolStateToCandidates(snapshot, profile)`. This brings the same pool-first pick to the one-shot
+  CLI triage path so the CLI and live agents agree on the model.
+  - The report/brainstorm now prefer the pool's top-ranked model for the **`reasoning`** profile
+    (the triage gate's safety rests on reasoning-grade complexity judgment). In a real dogfood run,
+    this flipped an item the weak model mis-read as `trivial`/dispatchable to a correct
+    `moderate` → held-to-human — without any config change.
+  - The static `agent.backends.*.model` list remains the documented **fallback** for pool-less
+    adopters and non-Ollama backends; a missing/empty/broken pool degrades to it silently (never an
+    error). An explicit `--model` still wins; explicit cloud (`intelligence.provider`) backends
+    ignore the local pool pick.
+  - Orchestrator now re-exports the pool-state primitives (`PoolStateStore`,
+    `poolStateToCandidates`, `DEFAULT_POOL_STATE_PATH`, `PoolState`, `RankProfile`) so the CLI reads
+    the persisted pool without a new CLI→local-models package edge.
+
+### Patch Changes
+
+- bd850a8: refactor(setup): extract shared SETUP_CLIENTS descriptor
+
+  Extract the per-client install matrix from `setup.ts`'s inline array into a
+  shared `packages/cli/src/setup/clients.ts` descriptor (with a `print-clients.ts`
+  tsx emitter), consumed by both `harness setup` and the new generated agent-setup
+  `prompt.md`. `runMcpSetup` is behavior-neutral — same five clients, same detect
+  dirs and config targets, same OpenCode cross-platform path handling. No
+  user-facing CLI behavior change.
+
+- c80086a: fix(cleanup): expose drift `type` and `line` in `harness cleanup --json` output
+
+  `harness cleanup` and `harness ci check` report the same underlying
+  documentation-drift finding but serialized it differently: `ci check` emitted
+  `{message:"Doc drift (api-signature): …", file, line}` while `cleanup` emitted
+  `{file, issue:"NOT_FOUND: …"}` — dropping the drift `type` (category) and the
+  `line`. A consumer filtering drift by category (e.g. `api-signature`) across
+  both commands silently saw zero for `cleanup` regardless of behavior, which read
+  as a false "cleanup honors the config but ci check doesn't" discrepancy (#838).
+
+  Each `driftIssues[]` entry now additionally carries `type` (the drift category)
+  and `line`, mirroring `ci check`. Purely additive — the existing `file` and
+  `issue` fields are unchanged. No threading change was needed: both commands
+  already honor `entropy.drift`; this only aligns their output shape.
+
+- 7c6a4e7: fix(design): drift scanner ignores hex-shaped strings in comments and issue-ref string literals (#750)
+
+  The DRIFT-T\* token-bypass scanner (`detect-design-drift`, surfaced by
+  `harness check-design` / `align-design-system`) matched hex- and px-shaped
+  strings anywhere in the raw source, including comment text. This produced two
+  false-positive classes: GitHub issue/PR references like `(#529)` in a JSDoc
+  were reported as `DRIFT-T001` "color #529", and hex values merely described
+  in comment prose (e.g. ``e.g. `#e63535` ``) were flagged as hardcoded colors —
+  with the same matcher also flagging spacing prose as `DRIFT-T003`.
+
+  The scanner now classifies each source offset as code, string, or comment with
+  a lightweight lexer (`//` line comments, `/* */` block comments across lines,
+  and quoted strings with escapes) and skips comment-context matches. Hex matches
+  inside string literals are additionally rejected only when they match the
+  parenthesized issue-reference idiom `(#NNN)` (e.g. test titles like
+  `describe('… (#332 Tier-3)')`). Genuine in-code color literals — including
+  all-numeric ones like `#666`/`#333` and CSS-shorthand values like
+  `"1px solid #0066cc"` — still flag, so no true positives are traded away. This
+  is deliberately _not_ the lossy "skip bare 3–4 digit numerics" heuristic, which
+  would suppress real 3-digit hex literals.
+
+- 5e24934: fix(generate-slash-commands): add `--skills-dir-only` to scope generation to a single skills tree (#704)
+
+  `harness generate-slash-commands --skills-dir <path>` was only additive: it
+  still resolved project, community, and machine-wide global skill sources
+  alongside the given dir. This let globally-installed third-party skills
+  (`~/.harness/skills/community/…`) leak into generated artifacts.
+
+  Adds an opt-in `--skills-dir-only` flag (`GenerateOptions.skillsDirOnly`) that
+  makes `--skills-dir` the exclusive source, skipping all ambient resolution. The
+  repo's own plugin-artifact generator uses it so foreign global skills can no
+  longer leak into tracked plugin dirs. Default behavior (`harness setup`,
+  `harness generate`, MCP) is unchanged — the flag is off unless explicitly set.
+
+- fac4261: fix(triage): don't label a deferred open-decisions lever as "no provider (offline)"
+
+  The cheap-first report holds obviously-out-of-band items (scope-too-large, not-in-band) before
+  spending an LLM call, so their open-decisions lever runs without a provider and printed
+  `open-decisions: no provider (offline)` — misleading, since a provider WAS available and the
+  lever was simply deferred, not missing/mis-configured.
+
+  New `ProbeDeps.modelDeferred` hint (threaded through `triageIssue`): when a model is available
+  but its levers were deferred for a cheap pass, the reason reads `not evaluated (item held before
+the model pass)`. A genuinely offline run (`--offline` / no provider wired) still reads
+  `no provider (offline)`. Wording only — the lever value stays `unknown` and the gate never
+  dispatches on an unread lever either way.
+
+- fac4261: fix(triage): health-check the pool model pick + reject truncated native output
+
+  Two silent-degradation fixes surfaced by an adversarial review of the local-model path:
+  - **Pool pick now health-checks against the endpoint's `/v1/models`** (`triage-pool.ts`). Before,
+    the CLI returned the top-ranked `pool.json` entry without verifying the endpoint serves it — so
+    a model `ollama rm`'d out-of-band, or a pool copied onto a host whose `pi` endpoint is
+    vLLM/LM-Studio (different model ids), got baked in as the model, every LLM lever 404'd, and the
+    report silently fell back to the static path while _claiming_ a model ran. It now picks the
+    highest-ranked candidate the endpoint actually serves and otherwise falls back to the config
+    list — true parity with the live `LocalModelResolver` (rank, then intersect with the probe).
+    Also guards a corrupt empty-string `ollamaName`.
+  - **Native `think:false` path rejects truncated output** (`openai-compatible.ts`). It now throws
+    on Ollama's `done_reason: 'length'` (mirroring the compat path's `finish_reason === 'length'`
+    guard) so a `format`-constrained partial-but-parseable body isn't returned as complete — it
+    falls back to the compat path instead. Added tests for the native fallback branches
+    (truncation, schema-invalid body, missing content).
+
+- b25c33a: Fix `harness roadmap triage` (and its brainstorm/approve path) to recognize the
+  `ollama` backend. The SEL-provider resolver and the pool health-check matched
+  only `type: 'local' | 'pi'`, but `ollama` became the default local backend
+  (#843). With the shipped default config the resolver returned `null`, so every
+  brainstorm halted with "no fork generator or provider wired" — the local-model
+  triage path could not run at all. Both call sites now also accept `type:
+'ollama'` (an OpenAI-compatible `/v1` endpoint). Verified live: the brainstorm
+  now resolves the local provider and the model scores items. Regression test
+  added for the `ollama` backend type (the suite previously only exercised
+  `local`/`pi`, which is why it stayed green while the real default failed).
+- Updated dependencies [77815a8]
+- Updated dependencies [d965516]
+- Updated dependencies [7d05321]
+- Updated dependencies [bad5b81]
+- Updated dependencies [c4c1dd3]
+- Updated dependencies [fac4261]
+- Updated dependencies [fac4261]
+- Updated dependencies [3e5f0ca]
+- Updated dependencies [a0ef808]
+- Updated dependencies [a06a08e]
+- Updated dependencies [545e818]
+- Updated dependencies [c80086a]
+- Updated dependencies [3b2b8ba]
+- Updated dependencies [402d56f]
+- Updated dependencies [0c8af29]
+- Updated dependencies [fac4261]
+- Updated dependencies [2e78d78]
+- Updated dependencies [1c95956]
+- Updated dependencies [5038b56]
+- Updated dependencies [e203b5e]
+- Updated dependencies [dc3c932]
+- Updated dependencies [bd850a8]
+- Updated dependencies [f8c9dd9]
+- Updated dependencies [fac4261]
+- Updated dependencies [fac4261]
+- Updated dependencies [fac4261]
+- Updated dependencies [fac4261]
+- Updated dependencies [fac4261]
+- Updated dependencies [8786245]
+  - @harness-engineering/orchestrator@0.17.0
+  - @harness-engineering/types@0.24.0
+  - @harness-engineering/core@0.37.2
+  - @harness-engineering/intelligence@0.10.0
+  - @harness-engineering/dashboard@0.14.6
+  - @harness-engineering/graph@0.11.10
+  - @harness-engineering/signals@0.2.8
+
 ## 9.0.0
 
 ### Minor Changes

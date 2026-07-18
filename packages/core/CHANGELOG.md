@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.37.2
+
+### Patch Changes
+
+- d965516: Tighten the review division-by-zero heuristic so it no longer flags
+  path-like slashes. The detector matched any `x/y`, so a scoped-package
+  import (`@harness-engineering/types`) read as a division — reddening the
+  floor-only (no-LLM) required-review tier on essentially every code PR.
+  It now skips `import`/`export` lines, comment/URL slashes, and requires a
+  real spaced division shape (`a / b`) with a variable/paren divisor — which
+  is how division always appears in a prettier-formatted codebase. Real
+  division is still detected; scoped imports and paths are not.
+- 7d05321: fix(entropy): stop the doc-drift detector flooding docs-heavy repos with false positives (#816)
+
+  `harness cleanup --type drift` (and the `detect-doc-drift` skill) treated every
+  backtick-quoted markdown token as a reference to a top-level TypeScript export,
+  producing ~100% false positives on prose- and spec-heavy repos — 36,697
+  findings on this repo alone, essentially all noise, which buried real drift and
+  made the `harness-docs-pipeline` DETECT phase unusable.
+
+  Reference extraction and resolution are now discriminating:
+  - **Extraction requires a code signal.** A backtick token is only kept when its
+    base identifier segment carries a structural marker (uppercase, digit, or
+    underscore) or it is written as a call (`foo()`). Bare prose words (`done`,
+    `local`, `grep`) and lowercase-headed code-example fragments (`db.query`,
+    `hooks.afterCreate`) are dropped. The non-TS source-file extension list is
+    expanded (`.py`, `.rs`, `.go`, …) so cited files from other languages are not
+    mistaken for symbols. This stays language-agnostic: `snake_case` and
+    `SCREAMING_SNAKE` tokens are kept because they are real symbols in
+    Python/Rust/Go.
+  - **Change specs are forward-looking.** `docs/changes/**` (proposals and phase
+    plans that describe proposed/illustrative code) join
+    `docs/architecture|decisions|proposals|adr` in the default forward-looking
+    suppression set.
+  - **Dotted references resolve by their head.** `User.email` is validated
+    against `User` (the only symbol the export map actually tracks) instead of the
+    full dotted path, so genuine member accesses are no longer flagged.
+  - **Convention suppression is language-aware.** `snake_case` / `SCREAMING_SNAKE`
+    doc tokens are suppressed only when the codebase exports nothing of that
+    convention — a TS project (no snake_case exports) stops flagging MCP tool
+    names and config keys, while a Python/Rust/Go project keeps flagging genuinely
+    removed snake_case symbols.
+
+  On this repo the detector drops from 36,697 to ~2,600 findings (94% fewer
+  api-signature findings) with zero regressions to the existing #492 and #723
+  multi-language coverage. The residual (camelCase parameter names, env vars,
+  broken links) is the class that only graph `documents`-edge detection can fully
+  resolve, tracked separately.
+
+- bad5b81: fix(review): SQL_CONCAT_PATTERN no longer flags prose as CWE-89 (#657)
+
+  The security floor reviewer's `SQL_CONCAT_PATTERN` matched a bare SQL keyword
+  followed anywhere on the line by `+ <word>`, so arithmetic-style prose such as
+  the markdown heading `UPDATE (medium + large tiers)` fired a `critical` CWE-89
+  "SQL injection" finding. Because `required-review` blocks on `critical` and the
+  floor tier runs without LLM adjudication when no `ANTHROPIC_API_KEY` is present,
+  a single prose false positive hard-blocked unrelated PRs (hit PR #656).
+
+  The pattern now requires the SQL keyword to live **inside a quoted string
+  literal or template literal** that is actually concatenated (`… " + userId`) or
+  interpolated (`` `SELECT … ${userId}` ``) — the genuine injection shape. Prose
+  keyword-plus-`+` no longer matches, while genuine
+  `db.query("SELECT * FROM users WHERE id = " + userId)` still flags CWE-89. As a
+  bonus the template-literal alternative now also catches a keyword that precedes
+  its `${…}` interpolation (previously only keyword-after-interpolation matched).
+
+- 5038b56: The review bug-detection heuristics (division-by-zero, empty-catch) now only
+  scan code files. They read raw lines and match code patterns, so running them
+  on non-code files produced false positives — most notably a `/` in a scoped
+  package name inside a Markdown changeset (`@scope/pkg`) read as a division,
+  flagging every publishable PR's changeset as "potential division by zero" in
+  the floor-only (no-LLM) review tier. Gated both detectors to
+  `.ts/.tsx/.js/.jsx/.mjs/.cjs/.mts/.cts` via an `isCodeFile` check.
+- e203b5e: Sharpen the floor-tier review heuristics so they stop firing on benign code
+  and docs (they were reddening the required-review gate on ordinary PRs):
+  - **SQL injection**: match SQL keywords as whole words, so prose like
+    `was updated` / `files created` in a log line or template literal no longer
+    reads as an `UPDATE`/`CREATE` query; and skip non-code files (a Markdown
+    table with the word "updated" was flagged as SQL injection).
+  - **Division-by-zero**: only flag a lowercase variable (or parenthesised)
+    divisor — a SCREAMING_CASE constant (`/ DAY_MS`) or numeric literal cannot
+    be zero at runtime.
+
+  Real SQL concatenation and real variable division are still detected.
+
+- dc3c932: fix(roadmap): stop `manage_roadmap` write actions from destructively re-serializing a hand-authored monolith (#839)
+
+  In single-file mode, every `manage_roadmap` write (`promote`, `add`, `update`,
+  etc.) persisted through `MonolithStore.write()`, which unconditionally
+  re-serializes the whole `docs/roadmap.md` from a model that captures only a fixed
+  set of single-line fields. Any hand-authored content the model does not model was
+  silently discarded on the round-trip: multi-line `- **Summary:**` bodies
+  truncated to their first line, `- **Issue:**` links dropped, `>` blockquote
+  intros and HTML comments deleted. On a ~1100-line hand-maintained roadmap this
+  lost ~957 lines.
+
+  `MonolithStore.write()` now refuses rather than destroys: before overwriting it
+  scans the on-disk file with a new `findUnpreservedLines` guard and returns a
+  `write-failed` error (never writing) when the file carries content a whole-file
+  rewrite would drop, pointing the user to shard the roadmap (`docs/roadmap.d/`,
+  which does surgical per-row writes) or remove the unmodeled content. Cosmetic
+  normalizations the serializer legitimately makes — canonicalizing the H1 title to
+  `# Roadmap`, stripping `Milestone:`/`Feature:` heading prefixes, and bumping
+  frontmatter timestamps — are tolerated, so canonically-formatted and real-world
+  roadmaps still write normally. The sharded backend and aggregate regeneration are
+  unaffected; the guard is single-file-only.
+
+- bd850a8: chore(security): suppress self-referential SEC-\* scanner false positives
+
+  Reword comment-only false positives and add inline `harness-ignore`
+  suppressions for the security scanner's own definitional patterns
+  (`injection-patterns.ts`) and the anti-bypass hooks that necessarily name the
+  flags they block. Comment/suppression-only — no runtime behavior change.
+
+- Updated dependencies [77815a8]
+- Updated dependencies [c4c1dd3]
+- Updated dependencies [fac4261]
+- Updated dependencies [3e5f0ca]
+- Updated dependencies [a0ef808]
+- Updated dependencies [545e818]
+- Updated dependencies [3b2b8ba]
+- Updated dependencies [f8c9dd9]
+  - @harness-engineering/types@0.24.0
+  - @harness-engineering/graph@0.11.10
+
 ## 0.37.1
 
 ### Patch Changes

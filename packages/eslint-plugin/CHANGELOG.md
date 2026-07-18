@@ -1,5 +1,34 @@
 # @harness-engineering/eslint-plugin
 
+## 0.5.0
+
+### Minor Changes
+
+- 938ba6f: Add the `no-focused-tests` rule: flags focused tests — `describe.only` /
+  `it.only` / `test.only`, and bare `fdescribe` / `fit` — so a focused test can't
+  slip into CI and silently skip the rest of the suite. Object-name-gated, so an
+  unrelated `.only` member access is not a false positive. Enabled as `error` in
+  the recommended config.
+- 89aaffc: Add the `no-hardcoded-test-count` ESLint rule. It flags hardcoded numeric literals in test-count
+  assertions — `expect(x).toHaveLength(<number>)` and `expect(x.length).toBe(<number>)` — which drift
+  silently as items are added or removed. A variable or computed expected value is not reported. The
+  rule is registered in the recommended config.
+- fac4261: feat(eslint-plugin): add `no-undefined-optional-assignment` rule
+
+  Flags an object-literal property whose value is a variable declared `T | undefined` assigned
+  directly (e.g. `{ field: maybeUndefined }`), which breaks `exactOptionalPropertyTypes`, and points
+  at the conditional-spread form `...(value !== undefined && { field: value })`. Sound + syntactic
+  (keys off the DECLARED annotation, since this plugin's RuleTester runs without type info): it flags
+  `let x: T | undefined; { field: x }` and typed `T | undefined` params, exempts the already-guarded
+  `(x !== undefined && { field: x })` form, and stays silent when the annotation is absent
+  (unknown ⇒ no false positive).
+
+  Authored as the human-review completion of an autonomous local-model draft (the model produced a
+  plausible type-aware attempt that didn't fit this repo's syntactic-only test infra and failed
+  typecheck).
+
+- b7d55ee: Add the `no-skipped-tests` ESLint rule, flagging `.skip` and `x`-prefixed (xit/xdescribe/xtest) tests.
+
 ## 0.4.0
 
 ### Minor Changes
